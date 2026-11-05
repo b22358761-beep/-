@@ -1,6 +1,6 @@
 /**
  * Thanawya World API — Protected Backend
- * VERSION v1.7.7 — Firebase default plus-f09b5 + CORS open + 1 video/min
+ * VERSION v1.7.8 — shared video sessions + 7 retries + CORS open + 1 video/min
  */
 import express from "express";
 import cors from "cors";
@@ -46,7 +46,7 @@ const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 const TEMP_DIR = path.join(DATA_DIR, "temp_files");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); fs.mkdirSync(TEMP_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v1.7.7";
+const APP_VERSION = "v1.7.8";
 
 process.on("unhandledRejection", (r) => console.error("[unhandledRejection]", (r && r.stack) || r));
 process.on("uncaughtException", (e) => console.error("[uncaughtException]", (e && e.stack) || e));
@@ -228,7 +228,8 @@ async function relayFetch(url, opts = {}, timeout = 15_000) {
   return relayRes;
 }
 
-async function fetchT(url, opts = {}, { timeout = 15_000, retries = 0, retryOn = [429, 502, 503, 504] } = {}) {
+const UPSTREAM_FETCH_RETRIES = Number(process.env.UPSTREAM_FETCH_RETRIES || 7);
+async function fetchT(url, opts = {}, { timeout = 15_000, retries = 0, retryOn = [429, 502, 503, 504, 408, 500] } = {}) {
   let lastErr;
   const tryRelay = Boolean(UPSTREAM_RELAY_URL);
   for (let a = 0; a <= retries; a++) {
@@ -300,7 +301,7 @@ const upstreamSlot = makeLimiter(Number(process.env.UPSTREAM_CONCURRENCY || 96))
 
 const SEG_CACHE_MAX = Number(process.env.SEGMENT_CACHE_MB || 256) * 1024 * 1024;
 const SEG_CACHE_TTL = 10 * 60_000;
-const PREFETCH_AHEAD = Number(process.env.PREFETCH_AHEAD || 1);
+const PREFETCH_AHEAD = Number(process.env.PREFETCH_AHEAD || 3);
 const segCache = new Map();
 let segCacheBytes = 0;
 function segDel(k) {
@@ -1227,7 +1228,7 @@ async function upstreamJsonRaw(apiPath, options = {}) {
     try {
       const headers = await upstreamHeaders(options.headers || {}, p);
       const r = await upstreamSlot(() =>
-        fetchT(url, { ...options, headers }, { timeout: 18_000, retries: isGet && p === 0 ? 1 : 0, retryOn: [429, 502, 503, 504] })
+        fetchT(url, { ...options, headers }, { timeout: 22_000, retries: UPSTREAM_FETCH_RETRIES, retryOn: [429, 502, 503, 504, 408, 500] })
       );
       const text = await r.text();
       if (isCloudflareBlock(r.status, text)) {
@@ -1321,13 +1322,7 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   }
   for (const [k, v] of Object.entries(extra || {})) { if (v != null && v !== "") headers[k] = v; }
   const hasRange = Boolean(headers.Range || headers.range);
-  // Segment fetches are latency-sensitive: do not wait through a second upstream retry.
-  // Playlist/key requests retain the longer timeout and one retry.
-  let isSegment = false;
-  try { isSegment = /\.(?:ts|m4s|woff2|cmfv|cmfa)(?:\?|$)/i.test(new URL(url).pathname); } catch {}
-  const timeout = isSegment ? 20_000 : 25_000;
-  const retries = (hasRange || isSegment) ? 0 : 1;
-  return upstreamSlot(() => fetchT(url, { headers, cache: "no-store" }, { timeout, retries }));
+  return upstreamSlot(() => fetchT(url, { headers, cache: "no-store" }, { timeout: 30_000, retries: hasRange ? 2 : UPSTREAM_FETCH_RETRIES }));
 }
 
 app.use(rateLimit({ max: 1500, windowMs: 60_000, scope: "global", skip: (req) => req.path.startsWith("/api/stream/") || req.path.startsWith("/api/hls/") || req.path === "/health" }));
@@ -2715,7 +2710,7 @@ app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
   } catch (e) { jsonError(res, 502, e.message); }
 });
 
-const SOURCE_TTL_MS = Number(process.env.SOURCE_TTL_MS || 3 * 60_000);
+const SOURCE_TTL_MS = Number(process.env.SOURCE_TTL_MS || 15 * 60_000);
 const sourceCache = new Map();
 const SID_TOKEN = "{{SID}}";
 
@@ -2757,8 +2752,7 @@ async function buildPlaylist(src, masterText, clientHeaders) {
     try {
       const u = new URL(absUrl);
       if (/stream-weave\.com$/i.test(u.hostname) || u.hostname.endsWith(".stream-weave.com")) {
-        // Keep signed query parameters: Stream-Weave may require them for segment authorization.
-        return u.href;
+        return u.href.split("?")[0];
       }
       const parts = u.pathname.split("/").filter(Boolean);
       const vi = parts.indexOf("videos");
@@ -2767,15 +2761,13 @@ async function buildPlaylist(src, masterText, clientHeaders) {
         const quality = parts[vi + 2];
         const fname = (parts[vi + 3] || "").split("?")[0];
         if (vid && quality && fname) {
-          // Preserve the original query string (signature / expiry parameters).
-          return `https://api.stream-weave.com/api/v1/videos/${vid}/stream/${quality}/${fname}${u.search}`;
+          return `https://api.stream-weave.com/api/v1/videos/${vid}/stream/${quality}/${fname}`;
         }
       }
       if (fallbackVideoId && /\.(ts|m4s|woff2|cmfv|cmfa)(\?|$)/i.test(u.pathname)) {
         const fname = parts[parts.length - 1].split("?")[0];
         const quality = parts[parts.length - 2] || "600";
-        // Preserve signed query parameters when the playlist URL omits an explicit video path.
-        return `https://api.stream-weave.com/api/v1/videos/${fallbackVideoId}/stream/${quality}/${fname}${u.search}`;
+        return `https://api.stream-weave.com/api/v1/videos/${fallbackVideoId}/stream/${quality}/${fname}`;
       }
     } catch {}
     return absUrl;
@@ -2792,24 +2784,15 @@ async function buildPlaylist(src, masterText, clientHeaders) {
         keyIvAttr = `IV=${ivHex.startsWith("0x") || ivHex.startsWith("0X") ? ivHex : ("0x" + ivHex)}`;
       }
       if (uri && !keyFetched) {
-        const playlistKeyUrl = new URL(uri, baseUrl).href;
-        let keyUrl = playlistKeyUrl;
+        let keyUrl = new URL(uri, baseUrl).href;
         try {
-          // جرّب endpoint الرسمي في Weave أولاً، مع الاحتفاظ برابط الـ playlist كبديل.
-          if (src.mode === "weave" && !/stream-weave\.com/i.test(keyUrl) && src.videoId) {
+          if (!/stream-weave\.com/i.test(keyUrl) && src.videoId) {
             keyUrl = `https://api.stream-weave.com/api/v1/videos/${src.videoId}/key`;
           }
         } catch {}
         try { src.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
-        try { src.allowedHosts.add(new URL(playlistKeyUrl).hostname); } catch {}
         src.allowedHosts.add("api.stream-weave.com");
-        let keyRes = await streamFetch(src, keyUrl, {}, clientHeaders);
-        // بعض قوائم التشغيل تصدر رابط مفتاح موقّعاً خاصاً بها؛ لو رفض endpoint الرسمي الطلب، جرّب URI الأصلي مرة واحدة.
-        if (!keyRes.ok && keyUrl !== playlistKeyUrl && (keyRes.status === 401 || keyRes.status === 403)) {
-          try { await keyRes.arrayBuffer(); } catch {}
-          keyRes = await streamFetch(src, playlistKeyUrl, {}, clientHeaders);
-          if (keyRes.ok) keyUrl = playlistKeyUrl;
-        }
+        const keyRes = await streamFetch(src, keyUrl, {}, clientHeaders);
         if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
         const wrapped = Buffer.from(await keyRes.arrayBuffer());
         if (src.mode === "cdn" || String(uri).includes("/user/auth/")) src.plainKey = await unwrapCdnKey(wrapped);
@@ -2886,16 +2869,29 @@ async function buildVideoSource(videoId, clientHeaders) {
   let mode = null; let streamUrl = null; let sessionToken = null; let resolvedVideoId = videoId; let probeText = null;
   const errors = [];
 
-  try {
-    const data = await upstreamJson(`/video/${encodeURIComponent(videoId)}/stream-weave/play`, { method: "POST", headers: { Accept: "application/json" } });
-    if (!data?.success || !data?.data?.token || !data?.data?.stream_url) throw new Error("Weave response ناقص");
-    mode = "weave"; sessionToken = data.data.token; streamUrl = data.data.stream_url; resolvedVideoId = String(data.data.video_id || videoId);
-  } catch (e) { errors.push(e.message); }
+  // جلسة كورساتك/stream-weave — إعادة محاولة قوية ثم حفظ في الذاكرة (sourceCache)
+  {
+    let lastWeaveErr = null;
+    for (let attempt = 1; attempt <= UPSTREAM_FETCH_RETRIES; attempt++) {
+      try {
+        const data = await upstreamJson(`/video/${encodeURIComponent(videoId)}/stream-weave/play`, { method: "POST", headers: { Accept: "application/json" } });
+        if (!data?.success || !data?.data?.token || !data?.data?.stream_url) throw new Error("Weave response ناقص");
+        mode = "weave"; sessionToken = data.data.token; streamUrl = data.data.stream_url; resolvedVideoId = String(data.data.video_id || videoId);
+        lastWeaveErr = null;
+        break;
+      } catch (e) {
+        lastWeaveErr = e;
+        console.warn(`[weave] play attempt ${attempt}/${UPSTREAM_FETCH_RETRIES}:`, e.message);
+        if (attempt < UPSTREAM_FETCH_RETRIES) await delay(250 * attempt + Math.random() * 200);
+      }
+    }
+    if (lastWeaveErr) errors.push(lastWeaveErr.message);
+  }
 
   if (!mode) {
     try {
       const masterUrl = `${CONFIG.COURSATK_API}/video/stream/${encodeURIComponent(videoId)}/playlist.m3u8`;
-      const probe = await upstreamSlot(() => fetchT(masterUrl, { headers: { Authorization: `Bearer ${upstreamTok}`, Accept: "*/*", Origin: CONFIG.STREAM_ORIGIN, Referer: CONFIG.STREAM_REFERER, "User-Agent": CONFIG.STREAM_UA }, cache: "no-store" }, { timeout: 15_000, retries: 1 }));
+      const probe = await upstreamSlot(() => fetchT(masterUrl, { headers: { Authorization: `Bearer ${upstreamTok}`, Accept: "*/*", Origin: CONFIG.STREAM_ORIGIN, Referer: CONFIG.STREAM_REFERER, "User-Agent": CONFIG.STREAM_UA }, cache: "no-store" }, { timeout: 22_000, retries: UPSTREAM_FETCH_RETRIES }));
       if (!probe.ok) throw new Error(`CDN ${probe.status}`);
       const masterText = await probe.text();
       if (!masterText.includes("#EXTM3U")) throw new Error("CDN playlist غير صالح");
@@ -2905,70 +2901,10 @@ async function buildVideoSource(videoId, clientHeaders) {
 
   if (!mode || !streamUrl || !sessionToken) throw new Error(errors.join(" | ") || "مفيش منصة تشغيل");
 
-  const makeSource = (sourceMode, sourceUrl, token, sourceVideoId) => {
-    const allowedHosts = new Set(CONFIG.STREAM_HOSTS);
-    try { allowedHosts.add(new URL(sourceUrl).hostname); } catch {}
-    return {
-      reqVideoId: videoId, videoId: sourceVideoId, mode: sourceMode,
-      token, streamUrl: sourceUrl, allowedHosts, plainKey: null,
-      defaultIv: null, mediaSeq: 0, segs: [], playlist: "", createdAt: now()
-    };
-  };
-
-  let src = makeSource(mode, streamUrl, sessionToken, resolvedVideoId);
-  try {
-    await buildPlaylist(src, probeText, clientHeaders);
-  } catch (firstError) {
-    // قد تنتهي صلاحية توكن Weave عند طلب الـ master أو variant أو key؛ جدّد الجلسة مرة واحدة فقط.
-    const firstMessage = String(firstError?.message || "");
-    const authRejected = /^(?:Stream master|Variant|Key) HTTP (?:401|403)$/.test(firstMessage);
-    if (mode !== "weave" || !authRejected) throw firstError;
-
-    console.warn("[weave] playback request rejected — refreshing playback token once for", videoId, firstMessage);
-    const freshData = await upstreamJson(
-      `/video/${encodeURIComponent(videoId)}/stream-weave/play`,
-      { method: "POST", headers: { Accept: "application/json" } }
-    );
-    if (!freshData?.success || !freshData?.data?.token || !freshData?.data?.stream_url) {
-      throw new Error("Key HTTP 401 — تعذر تجديد توكن تشغيل Weave");
-    }
-
-    const freshVideoId = String(freshData.data.video_id || videoId);
-    src = makeSource("weave", freshData.data.stream_url, freshData.data.token, freshVideoId);
-    try {
-      await buildPlaylist(src, null, clientHeaders);
-    } catch (retryError) {
-      console.error("[weave] playback retry failed:", retryError.message);
-
-      // Weave may reject a specific video's master/variant even after token renewal.
-      // Try the existing authenticated CDN playlist route as a compatibility fallback.
-      try {
-        const cdnMasterUrl = `${CONFIG.COURSATK_API}/video/stream/${encodeURIComponent(videoId)}/playlist.m3u8`;
-        const cdnProbe = await upstreamSlot(() => fetchT(cdnMasterUrl, {
-          headers: {
-            Authorization: `Bearer ${upstreamTok}`,
-            Accept: "*/*",
-            Origin: CONFIG.STREAM_ORIGIN,
-            Referer: CONFIG.STREAM_REFERER,
-            "User-Agent": CONFIG.STREAM_UA
-          },
-          cache: "no-store"
-        }, { timeout: 15_000, retries: 1 }));
-
-        if (!cdnProbe.ok) throw new Error(`CDN HTTP ${cdnProbe.status}`);
-        const cdnMasterText = await cdnProbe.text();
-        if (!cdnMasterText.includes("#EXTM3U")) throw new Error("CDN playlist غير صالح");
-
-        const cdnSrc = makeSource("cdn", cdnMasterUrl, upstreamTok, videoId);
-        await buildPlaylist(cdnSrc, cdnMasterText, clientHeaders);
-        console.warn("[playback fallback] Weave rejected; CDN route succeeded for", videoId);
-        return cdnSrc;
-      } catch (cdnError) {
-        console.error("[playback fallback] CDN route failed:", cdnError.message);
-        throw new Error(`فشل تشغيل الفيديو بعد تجديد التوكن: ${retryError.message} | CDN fallback: ${cdnError.message}`);
-      }
-    }
-  }
+  const allowedHosts = new Set(CONFIG.STREAM_HOSTS);
+  try { allowedHosts.add(new URL(streamUrl).hostname); } catch {}
+  const src = { reqVideoId: videoId, videoId: resolvedVideoId, mode, token: sessionToken, streamUrl, allowedHosts, plainKey: null, defaultIv: null, mediaSeq: 0, segs: [], playlist: "", createdAt: now() };
+  await buildPlaylist(src, probeText, clientHeaders);
   return src;
 }
 
@@ -3030,7 +2966,8 @@ async function refreshSource(session, force = false) {
       session.src = fresh;
       if (session.id) {
         streamSessions.set(session.id, session);
-        persistStreamSession(session).catch(() => {});
+        if (session.shared) touchSharedPlay(session);
+        else persistStreamSession(session).catch(() => {});
       }
       return fresh;
     }
@@ -3040,19 +2977,71 @@ async function refreshSource(session, force = false) {
   return null;
 }
 
+// جلسات تشغيل مشتركة: نفس فيديو كورساتك → نفس جلسة HLS في الذاكرة لكل الطلاب
+const sharedPlayByVideo = new Map();
+
+function touchSharedPlay(session) {
+  if (!session) return;
+  session.lastUsed = now();
+  streamSessions.set(session.id, session);
+  const keys = new Set([String(session.videoId || "")]);
+  if (session.src?.reqVideoId) keys.add(String(session.src.reqVideoId));
+  if (session.src?.videoId) keys.add(String(session.src.videoId));
+  for (const k of keys) if (k) sharedPlayByVideo.set(k, session);
+}
+
+function getSharedPlay(videoId) {
+  const key = String(videoId || "");
+  if (!key) return null;
+  const s = sharedPlayByVideo.get(key);
+  if (!s) return null;
+  const t = now();
+  if (t - (s.lastUsed || 0) > CONFIG.STREAM_IDLE_MS || t - (s.createdAt || 0) > CONFIG.STREAM_MAX_MS) {
+    sharedPlayByVideo.delete(key);
+    try { streamSessions.delete(s.id); } catch {}
+    return null;
+  }
+  // لازم تكون لسه في streamSessions
+  if (!streamSessions.has(s.id)) {
+    streamSessions.set(s.id, s);
+  }
+  return s;
+}
+
 function assertStreamOwner(session, req) {
   if (!session) { const e = new Error("انتهت صلاحية التشغيل"); e.status = 404; throw e; }
+  const sk = req.query.sk || req.headers["x-stream-key"];
+  if (session.streamKey) {
+    if (!sk || sk !== session.streamKey) {
+      const e = new Error("غير مصرح — مفتاح التشغيل غير صالح");
+      e.status = 403;
+      throw e;
+    }
+  }
+  // جلسة مشتركة: أي طالب مسجّل دخوله يقدر يشغّل بنفس الرابط
+  if (session.shared) {
+    if (!req.sessionToken && !(req.session && req.session.code)) {
+      const e = new Error("مطلوب تسجيل الدخول");
+      e.status = 401;
+      throw e;
+    }
+    session.lastUsed = now();
+    return true;
+  }
   const code = req.session && req.session.code;
   const token = req.sessionToken;
   if (!code || session.ownerCode !== code) { const e = new Error("غير مصرح — الرابط ده مش لحسابك"); e.status = 403; throw e; }
   if (session.ownerToken && token && session.ownerToken !== token) { const e = new Error("غير مصرح — افتح الفيديو من جديد"); e.status = 403; throw e; }
-  const sk = req.query.sk || req.headers["x-stream-key"];
-  if (session.streamKey) { if (!sk || sk !== session.streamKey) { const e = new Error("غير مصرح — مفتاح التشغيل غير صالح"); e.status = 403; throw e; } }
   return true;
 }
 
 function revokeOtherSessions(ownerCode, videoId, keepId) {
-  for (const [id, s] of streamSessions) { if (id === keepId) continue; if (s.ownerCode === ownerCode && String(s.videoId) === String(videoId)) streamSessions.delete(id); }
+  // الجلسات المشتركة متتشالش — بس جلسات المستخدم الخاصة لنفس الفيديو
+  for (const [id, s] of streamSessions) {
+    if (id === keepId) continue;
+    if (s.shared) continue;
+    if (s.ownerCode === ownerCode && String(s.videoId) === String(videoId)) streamSessions.delete(id);
+  }
 }
 
 async function persistStreamSession(session) {
@@ -3135,8 +3124,16 @@ async function getStreamSession(id, touch = true) {
   return s;
 }
 
-// تم إزالة ليميت تشغيل الفيديوهات
-app.post("/api/play/:videoId", requireStudent, async (req, res) => {
+// ليميت الفيديوهات: كل توكن طالب = فيديو واحد فقط في الدقيقة
+const playLimiter = rateLimit({
+  max: 1,
+  windowMs: 60_000,
+  scope: "video-play",
+  keyFn: (req) => "tok:" + (req.sessionToken || getBearer(req) || clientIp(req)),
+  message: "وصلت للحد الأقصى: فيديو واحد فقط في الدقيقة — استنى شوية وجرّب تاني"
+});
+
+app.post("/api/play/:videoId", requireStudent, playLimiter, async (req, res) => {
   try {
     let videoId = String(req.params.videoId);
     if (CONFIG.THANAWICA_ENABLED && /^thv_\d+$/i.test(videoId)) {
@@ -3166,17 +3163,46 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
     if (src.youtubeUrl) return res.json({ success: true, data: { type: "youtube", youtube_url: src.youtubeUrl, url: src.youtubeUrl } });
     if (src.mode === "thanawica-mp4" && src.mp4Url) return res.json({ success: true, data: { type: "mp4", play_url: src.mp4Url, mp4_url: src.mp4Url } });
 
+    // إعادة استخدام جلسة تشغيل مشتركة لنفس فيديو كورساتك (كل المستخدمين)
+    const shareKeys = [String(src.videoId || ""), String(src.reqVideoId || ""), String(videoId || "")].filter(Boolean);
+    let sessionRow = null;
+    for (const k of shareKeys) {
+      sessionRow = getSharedPlay(k);
+      if (sessionRow) break;
+    }
+    if (sessionRow && sessionRow.src) {
+      // حدّث المصدر لو اتعمل refresh في الكاش
+      try {
+        const hit = sourceCache.get(String(src.reqVideoId || src.videoId || videoId));
+        if (hit && hit.src) sessionRow.src = hit.src;
+      } catch {}
+      touchSharedPlay(sessionRow);
+      const hlsPath = `/api/hls/${sessionRow.id}/master.m3u8?sk=${sessionRow.streamKey}`;
+      return res.json({ success: true, data: { play_url: hlsPath, manifest_url: hlsPath, shared: true } });
+    }
+
     const id = crypto.randomUUID().replace(/-/g, "");
     const streamKey = crypto.randomBytes(16).toString("hex");
     const deviceId = (req.session && req.session.deviceId) || (req.student && req.student.deviceId) || null;
     revokeOtherSessions(req.session.code, src.videoId, id);
 
-    const sessionRow = { id, src, videoId: src.videoId, ownerCode: req.session.code, ownerToken: req.sessionToken, ownerDeviceId: deviceId, streamKey, createdAt: now(), lastUsed: now() };
+    sessionRow = {
+      id,
+      src,
+      videoId: src.videoId,
+      shared: true,
+      ownerCode: null,
+      ownerToken: null,
+      ownerDeviceId: deviceId,
+      streamKey,
+      createdAt: now(),
+      lastUsed: now()
+    };
     streamSessions.set(id, sessionRow);
-    persistStreamSession(sessionRow).catch(() => {});
+    touchSharedPlay(sessionRow);
+    // مش بنكتب Firebase لكل مشاهد — الجلسة المشتركة في الذاكرة أسرع وأخف
     const hlsPath = `/api/hls/${id}/master.m3u8?sk=${streamKey}`;
-    // play_url + manifest_url للتوافق مع كل نسخ الفرونت
-    res.json({ success: true, data: { play_url: hlsPath, manifest_url: hlsPath } });
+    res.json({ success: true, data: { play_url: hlsPath, manifest_url: hlsPath, shared: true } });
   } catch (e) {
     try { const yt = await tryResolveYoutube(String(req.params.videoId || "")); if (yt) return res.json({ success: true, data: { type: "youtube", youtube_url: yt, url: yt } }); } catch {}
     console.error("[play]", e.message);
@@ -3371,7 +3397,7 @@ app.get("/api/hls/:pid/seg/:idx", requireStudent, async (req, res) => {
   try {
     const plain = await getSegmentPlain(session, meta, url, iv, req.headers);
     res.status(200);
-    res.set({ "Content-Type": "video/mp2t", "Content-Length": String(plain.length), "Cache-Control": "private, max-age=30", "Accept-Ranges": "bytes" });
+    res.set({ "Content-Type": "video/mp2t", "Content-Length": String(plain.length), "Cache-Control": "no-store", "Accept-Ranges": "bytes" });
     res.send(plain);
     if (!req.headers.range) prefetchAhead(session, meta, req.headers);
   } catch (e) {
@@ -4483,6 +4509,9 @@ setInterval(() => {
   for (const [k, s] of studentSessions) if (s.expiresAt && t > s.expiresAt) studentSessions.delete(k);
   for (const [k, s] of adminSessions) if (s.expiresAt && t > s.expiresAt) adminSessions.delete(k);
   for (const [k, s] of streamSessions) if (t - s.lastUsed > CONFIG.STREAM_IDLE_MS || t - s.createdAt > CONFIG.STREAM_MAX_MS) streamSessions.delete(k);
+  for (const [k, s] of sharedPlayByVideo) {
+    if (!s || t - (s.lastUsed || 0) > CONFIG.STREAM_IDLE_MS || t - (s.createdAt || 0) > CONFIG.STREAM_MAX_MS || !streamSessions.has(s.id)) sharedPlayByVideo.delete(k);
+  }
   for (const [k, e] of sourceCache) if (t > e.exp + 60_000) sourceCache.delete(k);
   for (const [k, e] of upCache) if (t > e.stale) upCache.delete(k);
   for (const [k, e] of authCache) if (t > e.exp) authCache.delete(k);
