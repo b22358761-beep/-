@@ -2930,7 +2930,34 @@ async function buildVideoSource(videoId, clientHeaders) {
       await buildPlaylist(src, null, clientHeaders);
     } catch (retryError) {
       console.error("[weave] playback retry failed:", retryError.message);
-      throw new Error(`فشل تشغيل الفيديو بعد تجديد التوكن: ${retryError.message}`);
+
+      // Weave may reject a specific video's master/variant even after token renewal.
+      // Try the existing authenticated CDN playlist route as a compatibility fallback.
+      try {
+        const cdnMasterUrl = `${CONFIG.COURSATK_API}/video/stream/${encodeURIComponent(videoId)}/playlist.m3u8`;
+        const cdnProbe = await upstreamSlot(() => fetchT(cdnMasterUrl, {
+          headers: {
+            Authorization: `Bearer ${upstreamTok}`,
+            Accept: "*/*",
+            Origin: CONFIG.STREAM_ORIGIN,
+            Referer: CONFIG.STREAM_REFERER,
+            "User-Agent": CONFIG.STREAM_UA
+          },
+          cache: "no-store"
+        }, { timeout: 15_000, retries: 1 }));
+
+        if (!cdnProbe.ok) throw new Error(`CDN HTTP ${cdnProbe.status}`);
+        const cdnMasterText = await cdnProbe.text();
+        if (!cdnMasterText.includes("#EXTM3U")) throw new Error("CDN playlist غير صالح");
+
+        const cdnSrc = makeSource("cdn", cdnMasterUrl, upstreamTok, videoId);
+        await buildPlaylist(cdnSrc, cdnMasterText, clientHeaders);
+        console.warn("[playback fallback] Weave rejected; CDN route succeeded for", videoId);
+        return cdnSrc;
+      } catch (cdnError) {
+        console.error("[playback fallback] CDN route failed:", cdnError.message);
+        throw new Error(`فشل تشغيل الفيديو بعد تجديد التوكن: ${retryError.message} | CDN fallback: ${cdnError.message}`);
+      }
     }
   }
   return src;
