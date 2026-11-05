@@ -2785,7 +2785,9 @@ async function buildPlaylist(src, masterText, clientHeaders) {
       if (uri && !keyFetched) {
         let keyUrl = new URL(uri, baseUrl).href;
         try {
-          if (!/stream-weave\.com/i.test(keyUrl) && src.videoId) {
+          // في وضع Weave فقط: استخدم endpoint المفتاح الرسمي عند الحاجة.
+// في وضع CDN نحتفظ بعنوان المفتاح الأصلي الموجود في الـ playlist.
+          if (src.mode === "weave" && !/stream-weave\.com/i.test(keyUrl) && src.videoId) {
             keyUrl = `https://api.stream-weave.com/api/v1/videos/${src.videoId}/key`;
           }
         } catch {}
@@ -2887,10 +2889,43 @@ async function buildVideoSource(videoId, clientHeaders) {
 
   if (!mode || !streamUrl || !sessionToken) throw new Error(errors.join(" | ") || "مفيش منصة تشغيل");
 
-  const allowedHosts = new Set(CONFIG.STREAM_HOSTS);
-  try { allowedHosts.add(new URL(streamUrl).hostname); } catch {}
-  const src = { reqVideoId: videoId, videoId: resolvedVideoId, mode, token: sessionToken, streamUrl, allowedHosts, plainKey: null, defaultIv: null, mediaSeq: 0, segs: [], playlist: "", createdAt: now() };
-  await buildPlaylist(src, probeText, clientHeaders);
+  const makeSource = (sourceMode, sourceUrl, token, sourceVideoId) => {
+    const allowedHosts = new Set(CONFIG.STREAM_HOSTS);
+    try { allowedHosts.add(new URL(sourceUrl).hostname); } catch {}
+    return {
+      reqVideoId: videoId, videoId: sourceVideoId, mode: sourceMode,
+      token, streamUrl: sourceUrl, allowedHosts, plainKey: null,
+      defaultIv: null, mediaSeq: 0, segs: [], playlist: "", createdAt: now()
+    };
+  };
+
+  let src = makeSource(mode, streamUrl, sessionToken, resolvedVideoId);
+  try {
+    await buildPlaylist(src, probeText, clientHeaders);
+  } catch (firstError) {
+    // توكن تشغيل Weave قد ينتهي قبل طلب المفتاح؛ جدّد جلسة التشغيل مرة واحدة فقط.
+    if (mode !== "weave" || !/^Key HTTP (401|403)$/.test(String(firstError?.message || ""))) {
+      throw firstError;
+    }
+
+    console.warn("[key] Weave key rejected — refreshing playback token once for", videoId);
+    const freshData = await upstreamJson(
+      `/video/${encodeURIComponent(videoId)}/stream-weave/play`,
+      { method: "POST", headers: { Accept: "application/json" } }
+    );
+    if (!freshData?.success || !freshData?.data?.token || !freshData?.data?.stream_url) {
+      throw new Error("Key HTTP 401 — تعذر تجديد توكن تشغيل Weave");
+    }
+
+    const freshVideoId = String(freshData.data.video_id || videoId);
+    src = makeSource("weave", freshData.data.stream_url, freshData.data.token, freshVideoId);
+    try {
+      await buildPlaylist(src, null, clientHeaders);
+    } catch (retryError) {
+      console.error("[key] Weave key retry failed:", retryError.message);
+      throw new Error(`فشل جلب مفتاح الفيديو بعد تجديد التوكن: ${retryError.message}`);
+    }
+  }
   return src;
 }
 
