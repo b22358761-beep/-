@@ -1,6 +1,6 @@
 /**
  * Thanawya World API — Protected Backend
- * VERSION v1.7.8 — shared video sessions + 7 retries + CORS open + 1 video/min
+ * VERSION v1.7.9 — shared video sessions + 7 retries + 4 videos/min
  */
 import express from "express";
 import cors from "cors";
@@ -46,7 +46,7 @@ const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 const TEMP_DIR = path.join(DATA_DIR, "temp_files");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); fs.mkdirSync(TEMP_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v1.7.8";
+const APP_VERSION = "v1.7.9";
 
 process.on("unhandledRejection", (r) => console.error("[unhandledRejection]", (r && r.stack) || r));
 process.on("uncaughtException", (e) => console.error("[uncaughtException]", (e && e.stack) || e));
@@ -3124,13 +3124,13 @@ async function getStreamSession(id, touch = true) {
   return s;
 }
 
-// ليميت الفيديوهات: كل توكن طالب = فيديو واحد فقط في الدقيقة
+// ليميت الفيديوهات: كل توكن طالب = 4 فيديوهات في الدقيقة
 const playLimiter = rateLimit({
-  max: 1,
+  max: 4,
   windowMs: 60_000,
   scope: "video-play",
   keyFn: (req) => "tok:" + (req.sessionToken || getBearer(req) || clientIp(req)),
-  message: "وصلت للحد الأقصى: فيديو واحد فقط في الدقيقة — استنى شوية وجرّب تاني"
+  message: "وصلت للحد الأقصى: 4 فيديوهات في الدقيقة — استنى شوية وجرّب تاني"
 });
 
 app.post("/api/play/:videoId", requireStudent, playLimiter, async (req, res) => {
