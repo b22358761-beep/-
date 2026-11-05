@@ -3335,7 +3335,7 @@ app.get("/api/hls/:pid/seg/:idx", requireStudent, async (req, res) => {
   try {
     const plain = await getSegmentPlain(session, meta, url, iv, req.headers);
     res.status(200);
-    res.set({ "Content-Type": "video/mp2t", "Content-Length": String(plain.length), "Cache-Control": "no-store", "Accept-Ranges": "bytes" });
+    res.set({ "Content-Type": "video/mp2t", "Content-Length": String(plain.length), "Cache-Control": "private, max-age=30", "Accept-Ranges": "bytes" });
     res.send(plain);
     if (!req.headers.range) prefetchAhead(session, meta, req.headers);
   } catch (e) {
