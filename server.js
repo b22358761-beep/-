@@ -2783,17 +2783,24 @@ async function buildPlaylist(src, masterText, clientHeaders) {
         keyIvAttr = `IV=${ivHex.startsWith("0x") || ivHex.startsWith("0X") ? ivHex : ("0x" + ivHex)}`;
       }
       if (uri && !keyFetched) {
-        let keyUrl = new URL(uri, baseUrl).href;
+        const playlistKeyUrl = new URL(uri, baseUrl).href;
+        let keyUrl = playlistKeyUrl;
         try {
-          // في وضع Weave فقط: استخدم endpoint المفتاح الرسمي عند الحاجة.
-// في وضع CDN نحتفظ بعنوان المفتاح الأصلي الموجود في الـ playlist.
+          // جرّب endpoint الرسمي في Weave أولاً، مع الاحتفاظ برابط الـ playlist كبديل.
           if (src.mode === "weave" && !/stream-weave\.com/i.test(keyUrl) && src.videoId) {
             keyUrl = `https://api.stream-weave.com/api/v1/videos/${src.videoId}/key`;
           }
         } catch {}
         try { src.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
+        try { src.allowedHosts.add(new URL(playlistKeyUrl).hostname); } catch {}
         src.allowedHosts.add("api.stream-weave.com");
-        const keyRes = await streamFetch(src, keyUrl, {}, clientHeaders);
+        let keyRes = await streamFetch(src, keyUrl, {}, clientHeaders);
+        // بعض قوائم التشغيل تصدر رابط مفتاح موقّعاً خاصاً بها؛ لو رفض endpoint الرسمي الطلب، جرّب URI الأصلي مرة واحدة.
+        if (!keyRes.ok && keyUrl !== playlistKeyUrl && (keyRes.status === 401 || keyRes.status === 403)) {
+          try { await keyRes.arrayBuffer(); } catch {}
+          keyRes = await streamFetch(src, playlistKeyUrl, {}, clientHeaders);
+          if (keyRes.ok) keyUrl = playlistKeyUrl;
+        }
         if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
         const wrapped = Buffer.from(await keyRes.arrayBuffer());
         if (src.mode === "cdn" || String(uri).includes("/user/auth/")) src.plainKey = await unwrapCdnKey(wrapped);
@@ -2903,12 +2910,12 @@ async function buildVideoSource(videoId, clientHeaders) {
   try {
     await buildPlaylist(src, probeText, clientHeaders);
   } catch (firstError) {
-    // توكن تشغيل Weave قد ينتهي قبل طلب المفتاح؛ جدّد جلسة التشغيل مرة واحدة فقط.
-    if (mode !== "weave" || !/^Key HTTP (401|403)$/.test(String(firstError?.message || ""))) {
-      throw firstError;
-    }
+    // قد تنتهي صلاحية توكن Weave عند طلب الـ master أو variant أو key؛ جدّد الجلسة مرة واحدة فقط.
+    const firstMessage = String(firstError?.message || "");
+    const authRejected = /^(?:Stream master|Variant|Key) HTTP (?:401|403)$/.test(firstMessage);
+    if (mode !== "weave" || !authRejected) throw firstError;
 
-    console.warn("[key] Weave key rejected — refreshing playback token once for", videoId);
+    console.warn("[weave] playback request rejected — refreshing playback token once for", videoId, firstMessage);
     const freshData = await upstreamJson(
       `/video/${encodeURIComponent(videoId)}/stream-weave/play`,
       { method: "POST", headers: { Accept: "application/json" } }
@@ -2922,8 +2929,8 @@ async function buildVideoSource(videoId, clientHeaders) {
     try {
       await buildPlaylist(src, null, clientHeaders);
     } catch (retryError) {
-      console.error("[key] Weave key retry failed:", retryError.message);
-      throw new Error(`فشل جلب مفتاح الفيديو بعد تجديد التوكن: ${retryError.message}`);
+      console.error("[weave] playback retry failed:", retryError.message);
+      throw new Error(`فشل تشغيل الفيديو بعد تجديد التوكن: ${retryError.message}`);
     }
   }
   return src;
