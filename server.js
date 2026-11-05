@@ -300,7 +300,7 @@ const upstreamSlot = makeLimiter(Number(process.env.UPSTREAM_CONCURRENCY || 96))
 
 const SEG_CACHE_MAX = Number(process.env.SEGMENT_CACHE_MB || 256) * 1024 * 1024;
 const SEG_CACHE_TTL = 10 * 60_000;
-const PREFETCH_AHEAD = Number(process.env.PREFETCH_AHEAD || 3);
+const PREFETCH_AHEAD = Number(process.env.PREFETCH_AHEAD || 1);
 const segCache = new Map();
 let segCacheBytes = 0;
 function segDel(k) {
@@ -1321,7 +1321,13 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   }
   for (const [k, v] of Object.entries(extra || {})) { if (v != null && v !== "") headers[k] = v; }
   const hasRange = Boolean(headers.Range || headers.range);
-  return upstreamSlot(() => fetchT(url, { headers, cache: "no-store" }, { timeout: 25_000, retries: hasRange ? 0 : 1 }));
+  // Segment fetches are latency-sensitive: do not wait through a second upstream retry.
+  // Playlist/key requests retain the longer timeout and one retry.
+  let isSegment = false;
+  try { isSegment = /\.(?:ts|m4s|woff2|cmfv|cmfa)(?:\?|$)/i.test(new URL(url).pathname); } catch {}
+  const timeout = isSegment ? 20_000 : 25_000;
+  const retries = (hasRange || isSegment) ? 0 : 1;
+  return upstreamSlot(() => fetchT(url, { headers, cache: "no-store" }, { timeout, retries }));
 }
 
 app.use(rateLimit({ max: 1500, windowMs: 60_000, scope: "global", skip: (req) => req.path.startsWith("/api/stream/") || req.path.startsWith("/api/hls/") || req.path === "/health" }));
