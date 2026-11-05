@@ -3092,16 +3092,8 @@ async function getStreamSession(id, touch = true) {
   return s;
 }
 
-// ليميت الفيديوهات: كل توكن طالب = فيديو واحد فقط في الدقيقة
-const playLimiter = rateLimit({
-  max: 1,
-  windowMs: 60_000,
-  scope: "video-play",
-  keyFn: (req) => "tok:" + (req.sessionToken || getBearer(req) || clientIp(req)),
-  message: "وصلت للحد الأقصى: فيديو واحد فقط في الدقيقة — استنى شوية وجرّب تاني"
-});
-
-app.post("/api/play/:videoId", requireStudent, playLimiter, async (req, res) => {
+// تم إزالة ليميت تشغيل الفيديوهات
+app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   try {
     let videoId = String(req.params.videoId);
     if (CONFIG.THANAWICA_ENABLED && /^thv_\d+$/i.test(videoId)) {
