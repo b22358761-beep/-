@@ -2751,7 +2751,8 @@ async function buildPlaylist(src, masterText, clientHeaders) {
     try {
       const u = new URL(absUrl);
       if (/stream-weave\.com$/i.test(u.hostname) || u.hostname.endsWith(".stream-weave.com")) {
-        return u.href.split("?")[0];
+        // Keep signed query parameters: Stream-Weave may require them for segment authorization.
+        return u.href;
       }
       const parts = u.pathname.split("/").filter(Boolean);
       const vi = parts.indexOf("videos");
@@ -2760,13 +2761,15 @@ async function buildPlaylist(src, masterText, clientHeaders) {
         const quality = parts[vi + 2];
         const fname = (parts[vi + 3] || "").split("?")[0];
         if (vid && quality && fname) {
-          return `https://api.stream-weave.com/api/v1/videos/${vid}/stream/${quality}/${fname}`;
+          // Preserve the original query string (signature / expiry parameters).
+          return `https://api.stream-weave.com/api/v1/videos/${vid}/stream/${quality}/${fname}${u.search}`;
         }
       }
       if (fallbackVideoId && /\.(ts|m4s|woff2|cmfv|cmfa)(\?|$)/i.test(u.pathname)) {
         const fname = parts[parts.length - 1].split("?")[0];
         const quality = parts[parts.length - 2] || "600";
-        return `https://api.stream-weave.com/api/v1/videos/${fallbackVideoId}/stream/${quality}/${fname}`;
+        // Preserve signed query parameters when the playlist URL omits an explicit video path.
+        return `https://api.stream-weave.com/api/v1/videos/${fallbackVideoId}/stream/${quality}/${fname}${u.search}`;
       }
     } catch {}
     return absUrl;
